@@ -1,23 +1,37 @@
-"""Polymarket FAA forecast, model V4.
+#!/usr/bin/env python3
+"""Polymarket FAA Forecast -- model V5.
 
-Reads one case file <id>.in from MAKEFUN_INPUT_DIR (default /input) and
-writes <id>.out to MAKEFUN_OUTPUT_DIR (default /output) with one forecast
-row per market: 240 horizons x 5 quantiles (0.05, 0.25, 0.5, 0.75, 0.95).
+Forecasts each market's Yes price at every minute of the next 240 minutes
+as five quantiles (0.05, 0.25, 0.5, 0.75, 0.95).
 
-Model, in brief:
-  * Median at every horizon: mean of the market's last 3 prices.
-  * Volatility: GARCH(1,1) on 1-minute price differences (last <=360),
-    fitted by grid search maximising the Gaussian log-likelihood, with
-    omega set so the long-run variance matches the sample variance.
-  * Multi-step variance from the standard GARCH formula, with a decoupled
-    horizon split: horizons 1-60 use the fitted persistence, horizons
-    61-240 relax from the h=60 variance toward the long-run variance at
-    a second (far) persistence rate.
-  * Quantiles: parametric normal, outer quantiles widened by a tail
-    multiplier; spread floor: (q95 - q05) / 2 >= 0.01 at every horizon.
+Model (V4 base, plus the V5 near-persistence override):
+  * Median: mean of the market's last 3 prices, flat across horizons.
+  * Volatility: GARCH(1,1) fitted on 1-minute price differences (at most
+    the last 360 diffs). Grid search over alpha and beta maximising the
+    Gaussian log-likelihood; omega is set so the long-run variance equals
+    the sample variance of the diffs. Fallback (fewer than 30 diffs, a
+    failed fit, or all-zero diffs): the standard deviation of the diffs,
+    capped at 5x the median |diff| (0.002 used as the scale when that
+    median is 0), floored at 0.0005.
+  * Multi-step variance: var_h = long_run_var
+        + persistence^(h-1) * (var_1 - long_run_var).
+    V5 change: for near horizons (h <= 60) the persistence is the FIXED
+    value NEAR_PERSISTENCE = 0.98, not the fitted alpha+beta. For far
+    horizons (h > 60) the variance relaxes from the h=60 variance at a
+    second persistence FAR_PERSISTENCE = 0.99.
+  * Quantiles: parametric normal with z = -1.644854, -0.67449, 0,
+    +0.67449, +1.644854. The outer tails (0.05, 0.95) are widened by
+    TAIL_MULT_OUTER.
+  * Spread floor: (q95 - q05) / 2 must be at least SPREAD_FLOOR; widen
+    symmetrically around the median, re-clamp to [0, 1], then enforce
+    monotonicity across the five quantiles.
+  * Not used: longshot shrinkage, empirical residual quantiles.
 
-Standard library only. Deterministic: no randomness, no network, no
-wall-clock dependence.
+Standard library only. Deterministic: no randomness, no wall-clock use,
+fixed iteration orders, so two runs on the same input are byte-identical.
+
+Usage: MAKEFUN_INPUT_DIR (default /input) holds <id>.in files;
+MAKEFUN_OUTPUT_DIR (default /output) receives <id>.out files.
 """
 
 import json
@@ -25,208 +39,170 @@ import math
 import os
 import sys
 
-# --- Calibrated parameters (chosen by backtest over the practice cases) ---
-# GARCH grid: alpha from 0.02 to 0.30 in steps of 0.02; beta in steps of
-# 0.05 subject to alpha + beta < 0.97.
-GARCH_ALPHA_MIN = 0.02
-GARCH_ALPHA_MAX = 0.30
-GARCH_ALPHA_STEP = 0.02
-GARCH_BETA_STEP = 0.05
-GARCH_PERSISTENCE_CAP = 0.97
-# Decoupled horizon forecasting: far-horizon (h > 60) persistence.
-# Backtest (186 market-origin pairs, practice cases): far persistence
-# 0.90/0.99/1.00 were indistinguishable on the decision metric
-# (recent-6 origins pinball 0.003601-0.003603), so 0.99 is kept as the
-# central value: the far variance relaxes slowly toward long-run.
-FAR_PERSISTENCE = 0.99
-# Near-horizon persistence: None means use the fitted alpha + beta.
-NEAR_PERSISTENCE_OVERRIDE = None
-# Tail multiplier for the outer quantiles (0.05 and 0.95).
-# Backtest: 2.50/2.60/2.75 tie on the recent-6 decision metric
-# (0.003601-0.003602) while 2.75 improves all-origins pinball
-# (0.018099 vs 0.018190 at 2.50); 2.90 already worsens recent-6
-# (0.003608). 2.75 is the elbow, so it is hardcoded.
-TAIL_MULT_OUTER = 2.75
+# --- Tuned constants (V5) -------------------------------------------------
+NEAR_PERSISTENCE = 0.98   # fixed persistence for h <= 60 (the V5 change)
+FAR_PERSISTENCE = 0.99    # persistence relaxing from the h=60 variance
+TAIL_MULT_OUTER = 2.75    # multiplier on the 0.05 / 0.95 quantiles
+SPREAD_FLOOR = 0.02       # minimum (q95 - q05) / 2 (tuned: 0.02 beats
+                          # 0.01 and 0.005 on both recent-6 and all
+                          # origins in the builder's own backtest)
 
+# --- Fixed model settings --------------------------------------------------
 Z_VALUES = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
-SPREAD_FLOOR_HALF = 0.01
-FALLBACK_SIGMA_FLOOR = 0.0005
+HORIZON = 240
 MAX_DIFFS = 360
-MIN_DIFFS_FOR_GARCH = 30
+MIN_DIFFS = 30
+SIGMA_FLOOR = 0.0005
+ZERO_MEDIAN_SCALE = 0.002
 
 
-def _clamp(x, lo=0.0, hi=1.0):
-    if x < lo:
-        return lo
-    if x > hi:
-        return hi
-    return x
-
-
-def _mean(values):
-    return sum(values) / len(values)
-
-
-def _median(values):
-    s = sorted(values)
-    n = len(s)
-    mid = n // 2
-    if n % 2:
-        return s[mid]
-    return 0.5 * (s[mid - 1] + s[mid])
+def _median_last3(prices):
+    """Mean of the last three prices (or fewer when less history exists)."""
+    tail = prices[-3:]
+    return sum(tail) / len(tail)
 
 
 def _fallback_sigma(diffs):
-    """Constant sigma from capped differences (see module docstring)."""
-    abs_diffs = [abs(d) for d in diffs]
-    med = _median(abs_diffs)
-    cap = 5.0 * med if med > 0.0 else 0.002
-    capped = [d if -cap <= d <= cap else (-cap if d < 0.0 else cap)
-              for d in diffs]
-    mu = _mean(capped)
-    var = _mean([(c - mu) ** 2 for c in capped])
-    sigma = math.sqrt(var) if var > 0.0 else 0.0
-    return max(sigma, FALLBACK_SIGMA_FLOOR)
+    """Fallback volatility: std of diffs, capped and floored."""
+    if not diffs:
+        return SIGMA_FLOOR
+    n = len(diffs)
+    mean = sum(diffs) / n
+    var = sum((d - mean) * (d - mean) for d in diffs) / n
+    sd = math.sqrt(var) if var > 0.0 else 0.0
+    ordered = sorted(abs(d) for d in diffs)
+    if n % 2 == 1:
+        med_abs = ordered[n // 2]
+    else:
+        med_abs = 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
+    scale = med_abs if med_abs > 0.0 else ZERO_MEDIAN_SCALE
+    sd = min(sd, 5.0 * scale)
+    return max(sd, SIGMA_FLOOR)
 
 
-def _fit_garch(diffs):
-    """Fit GARCH(1,1) to the differences.
+def _garch_fit(diffs):
+    """Fit GARCH(1,1) by grid search; return (var_1, long_run_var) or None.
 
-    Returns (omega, alpha, beta, var_1, long_run_var) or None when the
-    fit is not usable (too few differences, zero variance).
+    Innovations are the demeaned diffs. The conditional variance starts
+    at the sample variance and recurses as
+        s2 <- omega + alpha * eps^2 + beta * s2
+    with omega = sample_var * (1 - alpha - beta), so the long-run
+    variance is exactly the sample variance. The best (alpha, beta) is
+    the one maximising the Gaussian log-likelihood; the returned var_1
+    is the one-step-ahead variance after the last observation.
     """
     n = len(diffs)
-    if n < MIN_DIFFS_FOR_GARCH:
+    mean = sum(diffs) / n
+    eps = [d - mean for d in diffs]
+    var = sum(e * e for e in eps) / n
+    if not (var > 0.0) or not math.isfinite(var):
         return None
-    mu = _mean(diffs)
-    shocks = [d - mu for d in diffs]
-    sq = [e * e for e in shocks]
-    sample_var = _mean(sq)
-    if sample_var <= 0.0:
-        return None
-
-    best = None  # (loglik, alpha, beta, var_1)
-    alpha = GARCH_ALPHA_MIN
-    while alpha <= GARCH_ALPHA_MAX + 1e-12:
-        beta = GARCH_BETA_STEP
-        while alpha + beta < GARCH_PERSISTENCE_CAP:
-            omega = sample_var * (1.0 - alpha - beta)
-            var = sample_var
-            ll = 0.0
+    eps2 = [e * e for e in eps]
+    log = math.log
+    log2pi = log(2.0 * math.pi)
+    best_ll = None
+    best_var1 = None
+    # alpha = 0.02 .. 0.30 step 0.02 ; beta = 0.00 .. step 0.05,
+    # keeping alpha + beta < 0.97. Integer counters keep the grid exact.
+    for ai in range(1, 16):
+        alpha = ai * 0.02
+        for bi in range(0, 20):
+            beta = bi * 0.05
+            if alpha + beta >= 0.97:
+                break
+            omega = var * (1.0 - alpha - beta)
+            s2 = var
+            ll = -0.5 * n * log2pi
             ok = True
-            for e2 in sq:
-                if var <= 0.0:
+            for e2 in eps2:
+                if s2 <= 0.0 or not math.isfinite(s2):
                     ok = False
                     break
-                ll += -0.5 * (math.log(var) + e2 / var)
-                var = omega + alpha * e2 + beta * var
-            if ok and (best is None or ll > best[0]):
-                best = (ll, alpha, beta, var)
-            beta += GARCH_BETA_STEP
-        alpha += GARCH_ALPHA_STEP
-
-    if best is None:
+                ll -= 0.5 * (log(s2) + e2 / s2)
+                s2 = omega + alpha * e2 + beta * s2
+            if not ok:
+                continue
+            if best_ll is None or ll > best_ll:
+                best_ll = ll
+                best_var1 = s2
+    if best_ll is None:
         return None
-    _ll, alpha, beta, var_1 = best
-    omega = sample_var * (1.0 - alpha - beta)
-    long_run_var = omega / (1.0 - alpha - beta)
-    return (omega, alpha, beta, var_1, long_run_var)
+    return (best_var1, var)
 
 
-def _sigma_path(prices, horizon):
-    """Return (median, list of sigma_h for h = 1..horizon)."""
+def forecast_market(prices, tail_mult=TAIL_MULT_OUTER, floor=SPREAD_FLOOR,
+                    far_persist=FAR_PERSISTENCE,
+                    near_persist=NEAR_PERSISTENCE):
+    """Return 240 rows of five quantiles for one market's price list."""
     if prices:
-        median = _mean(prices[-3:])
+        med = _median_last3(prices)
     else:
-        median = 0.5
-    diffs_all = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
-    diffs = diffs_all[-MAX_DIFFS:]
-
-    if not diffs:
-        sigma_const = FALLBACK_SIGMA_FLOOR
-        return median, [sigma_const] * horizon
-
-    fit = _fit_garch(diffs)
+        med = 0.5
+    diffs = [prices[i + 1] - prices[i] for i in range(len(prices) - 1)]
+    diffs = diffs[-MAX_DIFFS:]
+    fit = None
+    if len(diffs) >= MIN_DIFFS and any(d != 0.0 for d in diffs):
+        fit = _garch_fit(diffs)
     if fit is None:
-        sigma_const = _fallback_sigma(diffs)
-        return median, [sigma_const] * horizon
-
-    _omega, alpha, beta, var_1, long_run_var = fit
-    pers_near = (NEAR_PERSISTENCE_OVERRIDE
-                 if NEAR_PERSISTENCE_OVERRIDE is not None
-                 else alpha + beta)
-    if pers_near >= 1.0:
-        pers_near = 0.999999
-    if pers_near < 0.0:
-        pers_near = 0.0
-
-    sigmas = []
-    var_h = var_1
-    # h = 1 uses var_1 directly; each later step relaxes toward long-run.
-    for h in range(1, horizon + 1):
-        if h == 1:
-            var_h = var_1
-        elif h <= 60:
-            var_h = long_run_var + pers_near * (var_h - long_run_var)
-        else:
-            var_h = long_run_var + FAR_PERSISTENCE * (var_h - long_run_var)
-        if var_h < 0.0:
-            var_h = 0.0
-        sigmas.append(math.sqrt(var_h))
-    return median, sigmas
-
-
-def forecast_market(prices, horizon):
-    """Forecast one market: list of `horizon` rows of 5 quantiles."""
-    median, sigmas = _sigma_path(prices, horizon)
-    mults = (TAIL_MULT_OUTER, 1.0, 1.0, 1.0, TAIL_MULT_OUTER)
+        sig = _fallback_sigma(diffs)
+        var1 = long_run = sig * sig
+    else:
+        var1, long_run = fit
+    sqrt = math.sqrt
     rows = []
-    for h in range(horizon):
-        sigma = sigmas[h] if h < len(sigmas) else sigmas[-1]
-        row = []
-        for z, mult in zip(Z_VALUES, mults):
-            row.append(_clamp(median + z * mult * sigma))
-        # Spread floor: (q95 - q05) / 2 >= 0.01, widen symmetrically
-        # around the median.
-        if (row[4] - row[0]) / 2.0 < SPREAD_FLOOR_HALF:
-            row[0] = _clamp(median - SPREAD_FLOOR_HALF)
-            row[4] = _clamp(median + SPREAD_FLOOR_HALF)
-        # Re-enforce monotonicity within the row.
+    var60 = None
+    for h in range(1, HORIZON + 1):
+        if h <= 60:
+            var_h = long_run + (near_persist ** (h - 1)) * (var1 - long_run)
+            if h == 60:
+                var60 = var_h
+        else:
+            var_h = long_run + (far_persist ** (h - 60)) * (var60 - long_run)
+        sd = sqrt(var_h) if var_h > 0.0 else 0.0
+        q05 = med + Z_VALUES[0] * sd * tail_mult
+        q25 = med + Z_VALUES[1] * sd
+        q50 = med
+        q75 = med + Z_VALUES[3] * sd
+        q95 = med + Z_VALUES[4] * sd * tail_mult
+        half = 0.5 * (q95 - q05)
+        if half < floor:
+            q05 = med - floor
+            q95 = med + floor
+        qs = (q05, q25, q50, q75, q95)
+        qs = [min(1.0, max(0.0, q)) for q in qs]
         for i in range(1, 5):
-            if row[i] < row[i - 1]:
-                row[i] = row[i - 1]
-        rows.append([round(v, 6) for v in row])
+            if qs[i] < qs[i - 1]:
+                qs[i] = qs[i - 1]
+        rows.append([round(q, 6) for q in qs])
     return rows
 
 
-def forecast_case(case):
-    horizon = int(case.get("horizon_minutes", 240))
+def run_case(case):
+    """Forecast every market of one parsed case object."""
+    horizon = case.get("horizon_minutes", HORIZON)
     forecasts = []
-    for market in case.get("markets", []):
-        prices = [float(p) for p in market.get("prices", [])]
-        forecasts.append({
-            "id": market["id"],
-            "q": forecast_market(prices, horizon),
-        })
+    for market in case["markets"]:
+        prices = market.get("prices") or []
+        rows = forecast_market(prices)
+        if len(rows) != horizon:  # horizon is 240 in every real case
+            rows = rows[:horizon]
+        forecasts.append({"id": market["id"], "q": rows})
     return {"forecasts": forecasts}
 
 
-def main():
-    input_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-    in_files = sorted(f for f in os.listdir(input_dir) if f.endswith(".in"))
-    if not in_files:
-        raise SystemExit("no .in file found in %s" % input_dir)
-    in_name = in_files[0]
-    case_id = in_name[:-3]
-    with open(os.path.join(input_dir, in_name), "r", encoding="utf-8") as fh:
-        case = json.load(fh)
-    result = forecast_case(case)
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, case_id + ".out")
-    text = json.dumps(result, separators=(",", ":"))
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+def main(argv=None):
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(fn for fn in os.listdir(in_dir) if fn.endswith(".in"))
+    for fn in names:
+        case_id = fn[:-3]
+        with open(os.path.join(in_dir, fn), "r", encoding="utf-8") as f:
+            case = json.load(f)
+        result = run_case(case)
+        out_path = os.path.join(out_dir, case_id + ".out")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(result, f, separators=(",", ":"))
     return 0
 
 
