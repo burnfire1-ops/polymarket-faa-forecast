@@ -1,59 +1,57 @@
-# Polymarket FAA Outage Attribution Forecast
+# Polymarket FAA Forecast — Model V4
 
-Entry for the make.fun bounty **polymarket-faa-attribution-02**: forecast the
-Yes price of every market of Polymarket's FAA outage attribution family, as
-five quantiles (0.05, 0.25, 0.5, 0.75, 0.95) per minute, 4 hours ahead
-(240 minutes) over the 48 hours after entries close.
+Forecasts 1-minute Yes prices for each market over a 240-minute horizon,
+as quantiles at levels 0.05, 0.25, 0.5, 0.75 and 0.95.
 
 ## Model
 
-The forecast is a persistence-style distribution centred on the recent level,
-with a spread that adapts to each market's own recent volatility:
+- **Median:** the mean of the market's last 3 prices, flat across all
+  horizons (no drift). If fewer than 3 prices exist, the mean of those.
+- **Volatility — GARCH(1,1):** the 1-minute price differences are modelled
+  with a GARCH(1,1) process. Omega, alpha and beta are estimated from the
+  market's own history (last up to 360 differences) by a grid search over
+  alpha (0.02–0.30) and beta (alpha + beta < 0.97) maximising the Gaussian
+  log-likelihood, with omega set so the long-run variance matches the
+  sample variance of the differences. If there are fewer than 30
+  differences, the fit fails, or all differences are zero, a fallback is
+  used: the standard deviation of the differences capped at 5 times their
+  median absolute value (0.002 cap scale if that median is 0), floored
+  at 0.0005, as a constant sigma.
+- **Multi-step variance:** the h-step variance relaxes toward the
+  long-run variance omega / (1 − alpha − beta) with the standard GARCH
+  formula, var_h = long_run_var + (alpha + beta)^(h−1) · (var_1 − long_run_var).
+- **Decoupled horizon forecasting (DHF):** horizons 1–60 use the fitted
+  GARCH persistence; horizons 61–240 continue from the h=60 variance but
+  relax toward the long-run variance at a second, separately calibrated
+  persistence rate (hardcoded in `main.py`).
+- **Quantiles:** parametric normal — quantile = clamp(median + z_tau ·
+  mult_tau · sigma_h, 0, 1), with z = −1.644854, −0.67449, 0, 0.67449,
+  1.644854 and mult_tau = 2.75 for the outer quantiles (0.05, 0.95),
+  1.0 for the inner ones.
+- **Spread floor:** at every horizon (q95 − q05) / 2 is at least 0.01;
+  narrower rows are widened symmetrically around the median, then
+  re-clamped to [0, 1] with monotonicity re-enforced within the row.
+- No longshot shrinkage of the median toward 0.5, and no empirical
+  residual quantiles.
 
-- **Median:** the mean of the market's last 3 prices. No drift or trend
-  term — drift variants scored far worse in backtests.
-- **Spread:** per-market adaptive volatility — the winsorized population
-  standard deviation of the 1-minute price differences over the last 6
-  hours (360 diffs), floored at 0.0005 so a flat market still gets a
-  nonzero spread. The spread grows as `h**0.45` with horizon `h`, slower
-  than a random walk, because prediction-market levels mean-revert.
-- **Tails:** the outer 5% and 95% quantiles use a 2.5x wider normal
-  z-value than the plain normal z, giving fat tails.
-- **Formula:** `q = clamp(x + z' * sigma * h**0.45, 0, 1)`, where `x` is
-  the 3-minute mean centre, `z'` is the tail-adjusted z-value, and `sigma`
-  is the winsorized volatility. Quantiles are rounded to 6 decimal places.
+## Calibration (backtest over the practice cases)
 
-Python 3.13 stdlib only, deterministic, offline — no network, no clock,
-no randomness.
+Origins cut every 240 minutes before each case checkpoint (186
+market-origin pairs, deduplicated across cases). Mean pinball loss:
+**0.003602 over the 6 most recent origins** (the decision metric) and
+0.018099 over all origins — the older origins include a few very
+volatile slots (per-slot pinball up to 0.072). Calibrated values
+hardcoded in `main.py`: far persistence 0.99 (0.90/0.99/1.00 were
+indistinguishable on recent-6), outer tail multiplier 2.75 (ties 2.50
+on recent-6, better on all origins; 2.90 already worsens recent-6),
+near persistence = fitted GARCH alpha + beta, fine GARCH grid
+(alpha step 0.02, beta step 0.05).
 
-## Backtest
+## Running
 
-Local backtest on the kit's practice cases (11 distinct origins counted once
-— the 6 practice files are overlapping sliding windows of one timeline, so
-naive counting triple-counts recent origins):
+    MAKEFUN_INPUT_DIR=<dir with <id>.in> MAKEFUN_OUTPUT_DIR=<dir> python3 main.py
 
-- Round-2 model: **1.1938** mean pinball loss on all 11 distinct origins.
-- This V2 model: **1.2001** on all 11 distinct origins (nearly tied).
-- On the **6 most recent origins** — the regime the 16–18 Nov final window
-  resembles, since the FAA cause was already publicly attributed on 13 Nov —
-  V2 scores **0.3131** vs round-2's **0.3346** (about 6% better).
+Writes `<id>.out` (UTF-8 JSON, `{"forecasts": [{"id": ..., "q": [[...], ...]}]}`).
 
-Longer averages (15-minute mean/median) won big only on the old shock-era
-origins and lost 17–22% on the recent origins, so they were rejected. The
-6-hour volatility window was chosen over a 24-hour one because it adapts
-faster to volatility clustering. Drift variants scored far worse (1.52–1.86). The official practice score is
-computed server-side only.
-
-## Run
-
-```bash
-mkdir -p output
-MAKEFUN_INPUT_DIR=/path/to/input MAKEFUN_OUTPUT_DIR=output python3 main.py
-```
-
-Each `<id>.in` case in the input directory produces a single-line JSON
-`<id>.out` file with `{"forecasts": [{"id": ..., "q": [[5 numbers] x 240]}]}`.
-
-## License
-
-MIT.
+Python 3 standard library only; deterministic — the same input always
+produces byte-identical output, with no network or wall-clock dependence.
