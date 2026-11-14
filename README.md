@@ -35,7 +35,9 @@ prices):
 
 Drift variants scored far worse (1.52-1.86), so the median stays at the last
 price. The official practice score is computed server-side only. Outputs are
-deterministic: the same input always produces the same output.
+deterministic: the same input always produces the same output. The 6h
+volatility window was chosen over 24h because it adapts faster to volatility
+clustering.
 
 ## Run
 
