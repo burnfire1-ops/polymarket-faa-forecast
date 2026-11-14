@@ -60,6 +60,8 @@ def robust_sigma(diffs, window=SIG_WINDOW):
         return 0.0025
     med = statistics.median([abs(v) for v in d]) or 0.002
     cap = 5.0 * med
+    # 5x cap: the backtest showed a single news jump otherwise dominates
+    # the 6h stdev, inflating every later quantile spread for hours.
     dw = [max(-cap, min(cap, v)) for v in d]
     s = statistics.pstdev(dw) if len(dw) > 1 else 0.0025
     return max(s, SIG_FLOOR)

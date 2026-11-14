@@ -34,7 +34,8 @@ prices):
 - this forecaster: ~1.081 (about 4% better than the baseline)
 
 Drift variants scored far worse (1.52-1.86), so the median stays at the last
-price. The official practice score is computed server-side only.
+price. The official practice score is computed server-side only. Outputs are
+deterministic: the same input always produces the same output.
 
 ## Run
 
